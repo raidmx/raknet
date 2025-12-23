@@ -41,7 +41,16 @@ impl RakNetStream {
     /// Creates a new RakNetStream with the given socket and MTU.
     ///
     /// This spawns the receive and tick tasks that handle the connection.
-    pub fn new(socket: UdpSocket, remote_addr: SocketAddr, mtu: u16) -> Self {
+    ///
+    /// If `ready_notifier` is provided, it will be triggered once the full login sequence
+    /// completes (after receiving NewIncomingConnection). This allows delaying user access
+    /// until the connection is fully established.
+    pub fn new(
+        socket: UdpSocket,
+        remote_addr: SocketAddr,
+        mtu: u16,
+        ready_notifier: Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Self {
         let socket = Arc::new(socket);
         let state = SharedState::new(mtu);
 
@@ -49,11 +58,12 @@ impl RakNetStream {
         let (send_tx, send_rx) = mpsc::unbounded_channel();
         let (recv_tx, recv_rx) = mpsc::unbounded_channel();
 
-        // Spawn receive task
+        // Spawn receive task (ready_notifier is moved, not cloned)
         tokio::spawn(receive_task(
             socket.clone(),
             state.clone(),
             recv_tx,
+            ready_notifier,
         ));
 
         // Spawn send task
@@ -150,8 +160,10 @@ async fn receive_task(
     socket: Arc<UdpSocket>,
     state: Arc<SharedState>,
     app_data_tx: mpsc::UnboundedSender<Bytes>,
+    ready_notifier: Option<tokio::sync::oneshot::Sender<()>>,
 ) {
     let mut buf = vec![0u8; 2048];
+    let mut ready_notifier = ready_notifier; // Make mutable so we can take it
 
     loop {
         // Check if connection is closed
@@ -162,7 +174,7 @@ async fn receive_task(
         match socket.recv(&mut buf).await {
             Ok(len) => {
                 let packet = &buf[..len];
-                if let Err(e) = handle_packet(packet, &state, &app_data_tx, &socket).await {
+                if let Err(e) = handle_packet(packet, &state, &app_data_tx, &socket, &mut ready_notifier).await {
                     eprintln!("Error handling packet: {}", e);
                 }
                 state.metrics.record_recv(len);
@@ -183,6 +195,7 @@ async fn handle_packet(
     state: &Arc<SharedState>,
     app_data_tx: &mpsc::UnboundedSender<Bytes>,
     socket: &UdpSocket,
+    ready_notifier: &mut Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<()> {
     if packet.is_empty() {
         return Ok(());
@@ -209,7 +222,7 @@ async fn handle_packet(
         // Datagram packet (0x80-0x8f)
         id if is_datagram(id) => {
             let (seq, frames_data) = decode_datagram(packet)?;
-            handle_datagram(seq, frames_data, state, app_data_tx, socket).await
+            handle_datagram(seq, frames_data, state, app_data_tx, socket, ready_notifier).await
         }
 
         // ACK packet
@@ -238,6 +251,7 @@ async fn handle_datagram(
     state: &Arc<SharedState>,
     app_data_tx: &mpsc::UnboundedSender<Bytes>,
     socket: &UdpSocket,
+    ready_notifier: &mut Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<()> {
     // Check for duplicate
     let is_new = {
@@ -263,7 +277,7 @@ async fn handle_datagram(
     let mut buf = &frames_data[..];
     while !buf.is_empty() {
         let frame = Frame::decode(&mut buf)?;
-        handle_frame(frame, state, app_data_tx, socket).await?;
+        handle_frame(frame, state, app_data_tx, socket, ready_notifier).await?;
     }
 
     Ok(())
@@ -275,19 +289,116 @@ async fn handle_frame(
     state: &Arc<SharedState>,
     app_data_tx: &mpsc::UnboundedSender<Bytes>,
     socket: &UdpSocket,
+    ready_notifier: &mut Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<()> {
-    // Check if this is a protocol packet (not application data)
-    if !frame.payload.is_empty() {
-        let packet_id = frame.payload[0];
+    // Empty payload - don't process or forward
+    if frame.payload.is_empty() {
+        return Ok(());
+    }
+
+    let packet_id = frame.payload[0];
+
+    // ALWAYS handle these protocol packets internally (even when connected)
+    match packet_id {
+        ID_CONNECTED_PING => {
+            return handle_connected_ping(&frame.payload, state, socket).await;
+        }
+        ID_CONNECTED_PONG => {
+            return handle_connected_pong(&frame.payload, state).await;
+        }
+        ID_DISCONNECT_NOTIFICATION => {
+            state.mark_disconnected();
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    // Handle login sequence packets (only before connection established)
+    if !state.is_connected() {
         match packet_id {
             ID_CONNECTION_REQUEST => {
+                println!("📨 [CONNECTION REQUEST] received from client");
+                println!("   ├─ Packet ID: 0x{:02x}", packet_id);
+                println!("   └─ Processing login sequence...");
+
+                // If this packet has an order index, advance the ordered channel
+                // to prevent order index desync with application packets
+                if frame.reliability.is_ordered() {
+                    if let Some(order_idx) = frame.order_index {
+                        let channel = frame.order_channel as usize;
+                        let mut ordered_chan = state.ordered_channels[channel].lock();
+                        let expected = ordered_chan.next_index();
+
+                        // If this is the next expected packet, advance the counter
+                        if order_idx.get() == expected {
+                            let _ = ordered_chan.insert(order_idx.get(), frame.payload.clone());
+                        }
+                    }
+                }
+
                 return handle_connection_request(&frame.payload, socket, state).await;
             }
             ID_NEW_INCOMING_CONNECTION => {
-                return handle_new_incoming_connection(&frame.payload, state).await;
+                println!("🎉 [NEW INCOMING CONNECTION] received from client");
+                println!("   ├─ Packet ID: 0x{:02x}", packet_id);
+                println!("   └─ Final step of login sequence");
+
+                // If this packet has an order index, advance the ordered channel
+                if frame.reliability.is_ordered() {
+                    if let Some(order_idx) = frame.order_index {
+                        let channel = frame.order_channel as usize;
+                        let mut ordered_chan = state.ordered_channels[channel].lock();
+                        let expected = ordered_chan.next_index();
+
+                        if order_idx.get() == expected {
+                            let _ = ordered_chan.insert(order_idx.get(), frame.payload.clone());
+                        }
+                    }
+                }
+
+                // Mark connected
+                state.mark_connected();
+
+                // Notify listener
+                if let Some(notifier) = ready_notifier.take() {
+                    let _ = notifier.send(());
+                    println!("   ✓ Listener notified - connection ready for accept()");
+                }
+
+                return Ok(());
             }
-            _ => {} // Not a protocol packet, continue to handle as application data
+            ID_CONNECTION_REQUEST_ACCEPTED => {
+                // Ignore echo of our own ConnectionRequestAccepted
+                return Ok(());
+            }
+            _ => {
+                // Unknown packet during login - could be a game packet batched
+                // with login packets. Don't drop it - fall through to handle
+                // as a normal packet. It will be buffered in the app channel
+                // until the connection is fully established.
+                println!("📦 [EARLY GAME PACKET] ID: 0x{:02x} received during login - will buffer", packet_id);
+            }
         }
+    }
+
+    // Connection established - this is a game packet
+    // Log and forward to application layer
+    println!("📦 [GAME PACKET] ID: 0x{:02x}, Length: {} bytes, Reliability: {:?}",
+             packet_id, frame.payload.len(), frame.reliability);
+
+    // Hex dump first 32 bytes
+    if frame.payload.len() > 1 {
+        print!("   Data: ");
+        for (i, byte) in frame.payload[..frame.payload.len().min(32)].iter().enumerate() {
+            if i > 0 && i % 16 == 0 {
+                print!("\n         ");
+            }
+            print!("{:02x} ", byte);
+        }
+        if frame.payload.len() > 32 {
+            print!("... (+{} bytes)", frame.payload.len() - 32);
+        }
+        println!();
     }
 
     // Handle based on reliability level
@@ -307,16 +418,21 @@ async fn handle_frame(
                 } else {
                     // Use ordered channel
                     let channel = frame.order_channel as usize;
+                    let order_index = frame.order_index.unwrap_or(u24::new(0)).get();
+                    println!("   📊 Ordered packet - Channel: {}, Index: {}", channel, order_index);
+
                     let mut ordered_chan = state.ordered_channels[channel].lock();
 
-                    let payloads = ordered_chan.insert(
-                        frame.order_index.unwrap_or(u24::new(0)).get(),
-                        frame.payload
-                    );
+                    let payloads = ordered_chan.insert(order_index, frame.payload);
 
                     // Deliver all ready packets in order
-                    for payload in payloads {
-                        let _ = app_data_tx.send(payload);
+                    if payloads.is_empty() {
+                        println!("   ⏳ Waiting for earlier packets in sequence...");
+                    } else {
+                        println!("   ✅ Delivering {} packet(s) to application channel", payloads.len());
+                        for payload in payloads {
+                            let _ = app_data_tx.send(payload);
+                        }
                     }
                 }
             } else {
@@ -339,6 +455,8 @@ fn deliver_frame_payload(
 ) {
     // Check if frame is split (fragmented)
     if let Some(split_info) = frame.split {
+        println!("   🧩 Fragment {}/{} (ID: {})", split_info.index + 1, split_info.count, split_info.id);
+
         // Fragment reassembly
         let mut fragment_queue = state.fragment_queue.lock();
 
@@ -349,11 +467,13 @@ fn deliver_frame_payload(
             frame.payload,
         ) {
             // All fragments received - deliver complete packet
+            println!("   ✅ All fragments received! Delivering {} bytes to application", reassembled.len());
             let _ = app_data_tx.send(reassembled);
         }
         // Otherwise wait for more fragments
     } else {
         // Not fragmented - deliver immediately
+        println!("   ✅ Delivering {} bytes to application channel", frame.payload.len());
         let _ = app_data_tx.send(frame.payload);
     }
 }
@@ -416,16 +536,56 @@ async fn handle_connected_pong(packet: &[u8], state: &Arc<SharedState>) -> Resul
     Ok(())
 }
 
+/// Helper: Sends a single frame with ReliableOrdered delivery.
+///
+/// Encodes the frame, wraps it in a datagram, sends it, and adds to send queue.
+async fn send_reliable_frame(
+    payload: Bytes,
+    socket: &UdpSocket,
+    state: &Arc<SharedState>,
+) -> Result<()> {
+    let message_index = state.next_message_index();
+    let order_index = state.next_order_index(0);
+
+    let frame = Frame::new(Reliability::ReliableOrdered, payload)
+        .with_message_index(message_index)
+        .with_order(order_index, 0);
+
+    // Encode frame
+    let mut frame_buf = BytesMut::new();
+    frame.encode(&mut frame_buf);
+    let encoded_frame = frame_buf.freeze();
+
+    // Create datagram
+    let seq = state.next_send_seq();
+    let datagram = encode_datagram(seq, &[encoded_frame]);
+
+    // Send datagram
+    socket.send(&datagram).await?;
+    state.metrics.record_send(datagram.len());
+
+    // Add to send queue for retransmission tracking
+    {
+        let mut queue = state.send_queue.lock();
+        queue.insert(seq.get(), datagram);
+    }
+
+    Ok(())
+}
+
 /// Handles a ConnectionRequest packet from the client.
 ///
 /// This is sent by the client after receiving OpenConnectionReply2.
-/// Server responds with ConnectionRequestAccepted.
+/// Server responds with ConnectionRequestAccepted wrapped in a Frame.
 async fn handle_connection_request(
     packet: &[u8],
     socket: &UdpSocket,
-    _state: &Arc<SharedState>,
+    state: &Arc<SharedState>,
 ) -> Result<()> {
-    let (_client_guid, request_timestamp) = decode_connection_request(packet)?;
+    let (client_guid, request_timestamp) = decode_connection_request(packet)?;
+
+    println!("   ├─ Client GUID: {}", client_guid);
+    println!("   ├─ Request timestamp: {}", request_timestamp);
 
     // Get current timestamp for the accepted packet
     let accepted_timestamp = SystemTime::now()
@@ -436,33 +596,23 @@ async fn handle_connection_request(
     // Get the remote address from the socket
     let remote_addr = socket.peer_addr()?;
 
-    // Send ConnectionRequestAccepted
+    // Encode ConnectionRequestAccepted
     let accepted = encode_connection_request_accepted(
         remote_addr,
         request_timestamp,
         accepted_timestamp,
     );
 
-    socket.send(&accepted).await?;
+    // CRITICAL: Send as application data through reliability layer (in a Frame)
+    // NOT as a raw packet! The client expects it inside a datagram.
+    send_reliable_frame(accepted, socket, state).await?;
+
+    println!("   ✓ Sent CONNECTION REQUEST ACCEPTED (0x10) in Frame");
+    println!("   └─ Waiting for NewIncomingConnection...\n");
 
     Ok(())
 }
 
-/// Handles a NewIncomingConnection packet from the client.
-///
-/// This is the final step of the connection handshake.
-/// Marks the connection as fully established.
-async fn handle_new_incoming_connection(
-    packet: &[u8],
-    state: &Arc<SharedState>,
-) -> Result<()> {
-    let (_server_addr, _request_ts, _accepted_ts) = decode_new_incoming_connection(packet)?;
-
-    // Mark connection as fully established
-    state.mark_connected();
-
-    Ok(())
-}
 
 /// Send task - handles outgoing application data.
 async fn send_task(
@@ -501,32 +651,7 @@ async fn send_single_frame(
     socket: &UdpSocket,
     state: &Arc<SharedState>,
 ) -> Result<()> {
-    let reliability = Reliability::ReliableOrdered;
-    let message_index = state.next_message_index();
-    let order_index = state.next_order_index(0);
-
-    let frame = Frame::new(reliability, data)
-        .with_message_index(message_index)
-        .with_order(order_index, 0);
-
-    // Encode frame
-    let mut frame_buf = BytesMut::new();
-    frame.encode(&mut frame_buf);
-    let encoded_frame = frame_buf.freeze();
-
-    // Create datagram
-    let seq = state.next_send_seq();
-    let datagram = encode_datagram(seq, &[encoded_frame]);
-
-    // Send datagram
-    socket.send(&datagram).await?;
-    state.metrics.record_send(datagram.len());
-
-    // Add to send queue for tracking
-    let mut queue = state.send_queue.lock();
-    queue.insert(seq.get(), datagram);
-
-    Ok(())
+    send_reliable_frame(data, socket, state).await
 }
 
 /// Sends a fragmented packet as multiple frames.

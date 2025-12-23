@@ -320,8 +320,11 @@ impl RakNetListener {
         println!("   ✓ Sent OPEN CONNECTION REPLY 2 from session socket");
         println!("   ℹ️  4-tuple established: kernel will now route packets to session socket");
 
-        // Create RakNetStream for this connection
-        let stream = RakNetStream::new(session_socket, remote_addr, mtu);
+        // Create oneshot channel for connection readiness notification
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+
+        // Create RakNetStream for this connection with ready notifier
+        let stream = RakNetStream::new(session_socket, remote_addr, mtu, Some(ready_tx));
 
         // Connection starts in Connecting state
         // Will be marked as Connected after receiving NewIncomingConnection packet
@@ -333,13 +336,33 @@ impl RakNetListener {
             connections.insert(remote_addr, ());
         }
 
-        println!("   ✅ Connection handshake complete!");
-        println!("   📨 Sending connection to accept queue...\n");
+        println!("   📋 Initial handshake complete (OpenConnectionReply2 sent)");
+        println!("   ⏳ Waiting for login sequence to complete...");
+        println!("   ℹ️  Connection will be sent to accept queue after:");
+        println!("      1. Client sends ConnectionRequest (0x09)");
+        println!("      2. Server responds with ConnectionRequestAccepted (0x10)");
+        println!("      3. Client sends NewIncomingConnection (0x13)");
+        println!();
 
-        // Send to accept channel
-        if let Err(e) = self.accept_tx.send(stream) {
-            eprintln!("   ✗ Failed to send stream to accept channel: {}", e);
-        }
+        // Spawn task to wait for connection readiness before sending to accept channel
+        let accept_tx = self.accept_tx.clone();
+        let connections = self.connections.clone();
+        tokio::spawn(async move {
+            match ready_rx.await {
+                Ok(()) => {
+                    // Connection is fully established - send to accept channel
+                    println!("   📨 Login sequence complete! Sending connection to accept queue...\n");
+                    if let Err(e) = accept_tx.send(stream) {
+                        eprintln!("   ✗ Failed to send stream to accept channel: {}", e);
+                    }
+                }
+                Err(_) => {
+                    // Connection dropped before completing login sequence
+                    println!("   ⚠️  Connection dropped before login sequence completed");
+                    connections.write().await.remove(&remote_addr);
+                }
+            }
+        });
 
         Ok(())
     }

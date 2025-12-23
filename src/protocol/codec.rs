@@ -615,7 +615,7 @@ pub fn decode_disconnect_notification(data: &[u8]) -> Result<()> {
 ///
 /// Note: Frames are encoded using Frame::encode() from the frame module.
 pub fn encode_datagram(seq: crate::protocol::u24, frames: &[Bytes]) -> Bytes {
-    use crate::protocol::{write_u24_le, BIT_FLAG_DATAGRAM, BIT_FLAG_VALID};
+    use crate::protocol::{BIT_FLAG_DATAGRAM, BIT_FLAG_VALID};
 
     // Calculate total size
     let mut total_size = 1 + 3; // Packet ID + sequence number
@@ -628,8 +628,11 @@ pub fn encode_datagram(seq: crate::protocol::u24, frames: &[Bytes]) -> Bytes {
     // Write packet ID with flags
     buf.put_u8(BIT_FLAG_DATAGRAM | BIT_FLAG_VALID);
 
-    // Write sequence number (u24, little-endian)
-    write_u24_le(&mut buf, seq);
+    // Write sequence number (u24, little-endian) using BytesMut methods
+    let seq_val = seq.get();
+    buf.put_u8((seq_val & 0xFF) as u8);
+    buf.put_u8(((seq_val >> 8) & 0xFF) as u8);
+    buf.put_u8(((seq_val >> 16) & 0xFF) as u8);
 
     // Write all frames
     for frame in frames {

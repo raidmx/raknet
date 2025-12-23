@@ -101,21 +101,27 @@ pub const BIT_FLAG_ACK: u8 = 0x40;
 pub const BIT_FLAG_NACK: u8 = 0x20;
 
 /// Checks if a packet is a datagram (frame set).
+/// Datagram packets have bit 7 set, but NOT bits 6 or 5 (which indicate ACK/NACK).
 #[inline]
 pub fn is_datagram(packet_id: u8) -> bool {
     (packet_id & BIT_FLAG_DATAGRAM) != 0
+        && (packet_id & BIT_FLAG_ACK) == 0
+        && (packet_id & BIT_FLAG_NACK) == 0
 }
 
 /// Checks if a packet is an ACK.
+/// ACK packets: 0xc0 (bits 7 and 6 set).
 #[inline]
 pub fn is_ack(packet_id: u8) -> bool {
-    (packet_id & BIT_FLAG_ACK) != 0 && (packet_id & BIT_FLAG_DATAGRAM) == 0
+    (packet_id & (BIT_FLAG_DATAGRAM | BIT_FLAG_ACK)) == (BIT_FLAG_DATAGRAM | BIT_FLAG_ACK)
 }
 
 /// Checks if a packet is a NACK.
+/// NACK packets: 0xa0 (bits 7 and 5 set, bit 6 clear).
 #[inline]
 pub fn is_nack(packet_id: u8) -> bool {
-    (packet_id & BIT_FLAG_NACK) != 0 && (packet_id & BIT_FLAG_DATAGRAM) == 0
+    (packet_id & (BIT_FLAG_DATAGRAM | BIT_FLAG_NACK)) == (BIT_FLAG_DATAGRAM | BIT_FLAG_NACK)
+        && (packet_id & BIT_FLAG_ACK) == 0
 }
 
 #[cfg(test)]

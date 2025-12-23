@@ -243,13 +243,23 @@ pub fn read_u24_be(buf: &[u8]) -> u24 {
 /// Compares two sequence numbers accounting for wraparound.
 /// Returns true if `a` is less than `b` in sequence space.
 ///
-/// This correctly handles wraparound by using signed arithmetic.
+/// This correctly handles wraparound by using signed arithmetic in 24-bit space.
 /// For example, seq 5 is "greater than" seq 16777210 (near MAX),
 /// because 5 comes after 16777210 in wraparound sequence.
 #[inline]
 pub fn seq_less_than(a: u32, b: u32) -> bool {
-    let diff = a.wrapping_sub(b) as i32;
-    diff < 0
+    // Compute difference and mask to 24 bits
+    let diff = a.wrapping_sub(b) & 0x00FFFFFF;
+
+    // Sign-extend from 24-bit to 32-bit
+    // If bit 23 is set, it's negative in 24-bit space
+    let signed_diff = if (diff & 0x00800000) != 0 {
+        (diff | 0xFF000000) as i32 // Negative: set upper bits
+    } else {
+        diff as i32 // Positive
+    };
+
+    signed_diff < 0
 }
 
 /// Checks if a sequence number is within a range, accounting for wraparound.

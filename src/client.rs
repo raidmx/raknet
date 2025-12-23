@@ -73,7 +73,8 @@ impl RakNetClient {
             &mut self.socket,
             UdpSocket::bind("0.0.0.0:0").await?, // Placeholder
         );
-        let stream = RakNetStream::new(socket, server_addr, mtu);
+        // Client doesn't need ready notification - connection is complete after handshake
+        let stream = RakNetStream::new(socket, server_addr, mtu, None);
 
         // Step 6: Complete connection handshake
         self.complete_connection_handshake(&stream, server_addr, server_guid).await?;

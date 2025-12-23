@@ -62,19 +62,20 @@ impl RecvWindow {
     /// - `None` if the packet is outside the window (too old)
     pub fn mark_received(&mut self, seq: u32) -> Option<bool> {
         // Check if packet is too old (before window base)
-        if seq_less_than(seq, self.base_seq) {
+        // EXCEPT for the first packet - accept any sequence for first packet
+        if seq_less_than(seq, self.base_seq) && self.total_received > 0 {
             return None; // Too old, outside window
         }
 
-        // Calculate offset from base
-        let offset = seq.wrapping_sub(self.base_seq) as usize;
+        // Calculate offset from base (mask to 24-bit for correct wraparound)
+        let offset = (seq.wrapping_sub(self.base_seq) & 0x00FFFFFF) as usize;
 
         // Check if packet is beyond window
         if offset >= self.max_size {
             // Need to slide window forward
             self.slide_to(seq);
-            // After sliding, packet should be in window
-            let new_offset = seq.wrapping_sub(self.base_seq) as usize;
+            // After sliding, packet should be in window (mask to 24-bit)
+            let new_offset = (seq.wrapping_sub(self.base_seq) & 0x00FFFFFF) as usize;
             if new_offset >= self.max_size {
                 return None; // Still outside window (shouldn't happen)
             }
@@ -118,7 +119,8 @@ impl RecvWindow {
             return false; // Before window
         }
 
-        let offset = seq.wrapping_sub(self.base_seq) as usize;
+        // Mask to 24-bit for correct wraparound arithmetic
+        let offset = (seq.wrapping_sub(self.base_seq) & 0x00FFFFFF) as usize;
         if offset >= self.max_size {
             return false; // Beyond window
         }
@@ -137,12 +139,13 @@ impl RecvWindow {
             return missing; // No packets received yet
         }
 
-        let end_offset = self.highest_seq.wrapping_sub(self.base_seq) as usize;
+        // Mask to 24-bit for correct wraparound
+        let end_offset = (self.highest_seq.wrapping_sub(self.base_seq) & 0x00FFFFFF) as usize;
         let end_offset = end_offset.min(self.max_size - 1);
 
         for offset in 0..=end_offset {
             if !self.received[offset] {
-                let seq = self.base_seq.wrapping_add(offset as u32);
+                let seq = self.base_seq.wrapping_add(offset as u32) & 0x00FFFFFF;
                 missing.push(seq);
             }
         }
@@ -154,7 +157,8 @@ impl RecvWindow {
     ///
     /// This is called when a packet is received that's beyond the current window.
     fn slide_to(&mut self, new_seq: u32) {
-        let shift = new_seq.wrapping_sub(self.base_seq) as usize;
+        // Mask to 24-bit for correct wraparound
+        let shift = (new_seq.wrapping_sub(self.base_seq) & 0x00FFFFFF) as usize;
 
         if shift == 0 {
             return; // No sliding needed
@@ -163,12 +167,12 @@ impl RecvWindow {
         if shift >= self.max_size {
             // Complete reset - new window doesn't overlap old one
             self.received.fill(false);
-            self.base_seq = new_seq.wrapping_sub((self.max_size / 2) as u32);
+            self.base_seq = new_seq.wrapping_sub((self.max_size / 2) as u32) & 0x00FFFFFF;
         } else {
             // Partial slide
             self.received.copy_within(shift.., 0);
             self.received[self.max_size - shift..].fill(false);
-            self.base_seq = self.base_seq.wrapping_add(shift as u32);
+            self.base_seq = self.base_seq.wrapping_add(shift as u32) & 0x00FFFFFF;
         }
     }
 
