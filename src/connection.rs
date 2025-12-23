@@ -199,7 +199,7 @@ async fn handle_packet(
         // Datagram packet (0x80-0x8f)
         id if is_datagram(id) => {
             let (seq, frames_data) = decode_datagram(packet)?;
-            handle_datagram(seq, frames_data, state, app_data_tx).await
+            handle_datagram(seq, frames_data, state, app_data_tx, socket).await
         }
 
         // ACK packet
@@ -227,6 +227,7 @@ async fn handle_datagram(
     frames_data: Bytes,
     state: &Arc<SharedState>,
     app_data_tx: &mpsc::UnboundedSender<Bytes>,
+    socket: &UdpSocket,
 ) -> Result<()> {
     // Check for duplicate
     let is_new = {
@@ -252,7 +253,7 @@ async fn handle_datagram(
     let mut buf = &frames_data[..];
     while !buf.is_empty() {
         let frame = Frame::decode(&mut buf)?;
-        handle_frame(frame, state, app_data_tx).await?;
+        handle_frame(frame, state, app_data_tx, socket).await?;
     }
 
     Ok(())
@@ -263,7 +264,22 @@ async fn handle_frame(
     frame: Frame,
     state: &Arc<SharedState>,
     app_data_tx: &mpsc::UnboundedSender<Bytes>,
+    socket: &UdpSocket,
 ) -> Result<()> {
+    // Check if this is a protocol packet (not application data)
+    if !frame.payload.is_empty() {
+        let packet_id = frame.payload[0];
+        match packet_id {
+            ID_CONNECTION_REQUEST => {
+                return handle_connection_request(&frame.payload, socket, state).await;
+            }
+            ID_NEW_INCOMING_CONNECTION => {
+                return handle_new_incoming_connection(&frame.payload, state).await;
+            }
+            _ => {} // Not a protocol packet, continue to handle as application data
+        }
+    }
+
     // Handle based on reliability level
     match frame.reliability {
         Reliability::Unreliable | Reliability::UnreliableSequenced => {
@@ -386,6 +402,54 @@ async fn handle_connected_pong(packet: &[u8], state: &Arc<SharedState>) -> Resul
         let rtt = send_time.elapsed();
         state.metrics.update_rtt(rtt);
     }
+
+    Ok(())
+}
+
+/// Handles a ConnectionRequest packet from the client.
+///
+/// This is sent by the client after receiving OpenConnectionReply2.
+/// Server responds with ConnectionRequestAccepted.
+async fn handle_connection_request(
+    packet: &[u8],
+    socket: &UdpSocket,
+    _state: &Arc<SharedState>,
+) -> Result<()> {
+    let (_client_guid, request_timestamp) = decode_connection_request(packet)?;
+
+    // Get current timestamp for the accepted packet
+    let accepted_timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
+    // Get the remote address from the socket
+    let remote_addr = socket.peer_addr()?;
+
+    // Send ConnectionRequestAccepted
+    let accepted = encode_connection_request_accepted(
+        remote_addr,
+        request_timestamp,
+        accepted_timestamp,
+    );
+
+    socket.send(&accepted).await?;
+
+    Ok(())
+}
+
+/// Handles a NewIncomingConnection packet from the client.
+///
+/// This is the final step of the connection handshake.
+/// Marks the connection as fully established.
+async fn handle_new_incoming_connection(
+    packet: &[u8],
+    state: &Arc<SharedState>,
+) -> Result<()> {
+    let (_server_addr, _request_ts, _accepted_ts) = decode_new_incoming_connection(packet)?;
+
+    // Mark connection as fully established
+    state.mark_connected();
 
     Ok(())
 }

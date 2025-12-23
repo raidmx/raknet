@@ -259,10 +259,9 @@ impl RakNetListener {
         // Create RakNetStream for this connection
         let stream = RakNetStream::new(session_socket, remote_addr, mtu);
 
-        // Mark connection as established after handshake completes
-        // The client will send ConnectionRequest inside a datagram
-        // For now, mark it as connected immediately
-        stream.mark_connected();
+        // Connection starts in Connecting state
+        // Will be marked as Connected after receiving NewIncomingConnection packet
+        // (part of the full RakNet connection handshake)
 
         // Add to active connections
         {
