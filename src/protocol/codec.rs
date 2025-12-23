@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use crate::protocol::{check_magic, write_magic, MAGIC, PROTOCOL_VERSION};
+use crate::protocol::{check_magic, MAGIC};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use std::net::SocketAddr;
 
@@ -697,7 +697,7 @@ mod tests {
 
     #[test]
     fn test_encode_decode_open_connection_request_1() {
-        let protocol_version = PROTOCOL_VERSION;
+        let protocol_version = crate::PROTOCOL_VERSION;
         let mtu = 1400;
 
         let encoded = encode_open_connection_request_1(protocol_version, mtu);

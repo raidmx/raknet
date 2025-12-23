@@ -118,11 +118,6 @@ impl RakNetStream {
         self.recv_rx.recv().await
     }
 
-    /// Marks the connection as fully connected (after handshake).
-    pub(crate) fn mark_connected(&self) {
-        self.state.mark_connected();
-    }
-
     /// Gracefully closes the connection.
     pub async fn close(&self) -> Result<()> {
         if self.state.mark_disconnecting() {
@@ -132,6 +127,21 @@ impl RakNetStream {
         }
         self.state.mark_disconnected();
         Ok(())
+    }
+
+    /// Returns a snapshot of connection metrics.
+    pub fn metrics_snapshot(&self) -> crate::state::metrics::MetricsSnapshot {
+        self.state.metrics_snapshot()
+    }
+
+    /// Returns statistics about the send queue.
+    pub fn send_queue_stats(&self) -> crate::reliability::send_queue::SendQueueStats {
+        self.state.send_queue_stats()
+    }
+
+    /// Returns statistics about the receive window.
+    pub fn recv_window_stats(&self) -> crate::reliability::recv_window::RecvWindowStats {
+        self.state.recv_window_stats()
     }
 }
 

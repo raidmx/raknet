@@ -25,10 +25,10 @@ pub struct RakNetListener {
     server_guid: i64,
 
     /// Pong data sent in response to pings (server info, MOTD, etc.).
-    pong_data: Bytes,
+    pong_data: Arc<RwLock<Bytes>>,
 
-    /// Channel for accepting new connections.
-    accept_rx: mpsc::UnboundedReceiver<RakNetStream>,
+    /// Channel for accepting new connections (wrapped in Arc<Mutex> for shared access).
+    accept_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<RakNetStream>>>,
 
     /// Channel sender for new connections (cloned for handshake task).
     accept_tx: mpsc::UnboundedSender<RakNetStream>,
@@ -86,8 +86,8 @@ impl RakNetListener {
             socket: Arc::new(socket),
             local_addr,
             server_guid,
-            pong_data: Bytes::from(pong_data),
-            accept_rx,
+            pong_data: Arc::new(RwLock::new(Bytes::from(pong_data))),
+            accept_rx: Arc::new(tokio::sync::Mutex::new(accept_rx)),
             accept_tx,
             connections: Arc::new(RwLock::new(HashMap::new())),
         })
@@ -98,19 +98,24 @@ impl RakNetListener {
         Ok(self.local_addr)
     }
 
+    /// Returns the server's unique GUID.
+    pub fn server_guid(&self) -> i64 {
+        self.server_guid
+    }
+
     /// Sets the pong data sent in response to unconnected pings.
     ///
     /// This is typically used to set server information (MOTD, player count, etc.).
-    pub fn set_pong_data(&mut self, data: impl Into<Bytes>) {
-        self.pong_data = data.into();
+    pub async fn set_pong_data(&self, data: impl Into<Bytes>) {
+        *self.pong_data.write().await = data.into();
     }
 
     /// Accepts a new incoming connection.
     ///
     /// This method blocks until a new connection is ready or an error occurs.
     /// Use this in a loop to handle multiple connections.
-    pub async fn accept(&mut self) -> Result<RakNetStream> {
-        self.accept_rx.recv().await.ok_or(Error::ListenerClosed)
+    pub async fn accept(&self) -> Result<RakNetStream> {
+        self.accept_rx.lock().await.recv().await.ok_or(Error::ListenerClosed)
     }
 
     /// Runs the listener loop, handling incoming unconnected packets.
@@ -126,17 +131,35 @@ impl RakNetListener {
                     Ok((len, remote_addr)) => {
                         let packet = &buf[..len];
                         if packet.is_empty() {
+                            println!("packet length zero");
                             continue;
                         }
 
                         let packet_id = packet[0];
 
+                        // Log ALL incoming packets for debugging
+                        if packet_id != ID_UNCONNECTED_PING {
+                            println!("📥 [PACKET RECEIVED] from {}", remote_addr);
+                            println!("   ├─ Packet ID: 0x{:02x}", packet_id);
+                            println!("   └─ Size: {} bytes", len);
+                        }
+
                         match packet_id {
                             ID_UNCONNECTED_PING => {
-                                let _ = self.handle_unconnected_ping(packet, remote_addr).await;
+                                let listener = self.clone();
+                                let packet = packet.to_vec();
+                                // Spawn task to avoid blocking listener
+                                tokio::spawn(async move {
+                                    let _ = listener.handle_unconnected_ping(&packet, remote_addr).await;
+                                });
                             }
                             ID_OPEN_CONNECTION_REQUEST_1 => {
-                                let _ = self.handle_open_connection_request_1(packet, remote_addr).await;
+                                let listener = self.clone();
+                                let packet = packet.to_vec();
+                                // Spawn task to avoid blocking listener
+                                tokio::spawn(async move {
+                                    let _ = listener.handle_open_connection_request_1(&packet, remote_addr).await;
+                                });
                             }
                             ID_OPEN_CONNECTION_REQUEST_2 => {
                                 let listener = self.clone();
@@ -148,6 +171,20 @@ impl RakNetListener {
                             }
                             _ => {
                                 // Unknown or unhandled packet type
+                                println!("❓ [UNKNOWN PACKET] from {}", remote_addr);
+                                println!("   ├─ Packet ID: 0x{:02x}", packet_id);
+                                println!("   └─ Size: {} bytes", len);
+                                print!("   Data: ");
+                                for (i, byte) in packet[..len.min(32)].iter().enumerate() {
+                                    if i > 0 && i % 16 == 0 {
+                                        print!("\n         ");
+                                    }
+                                    print!("{:02x} ", byte);
+                                }
+                                if len > 32 {
+                                    print!("... (+{} bytes)", len - 32);
+                                }
+                                println!("\n");
                             }
                         }
                     }
@@ -164,18 +201,23 @@ impl RakNetListener {
     async fn handle_unconnected_ping(&self, packet: &[u8], remote_addr: SocketAddr) -> Result<()> {
         match decode_unconnected_ping(packet) {
             Ok((timestamp, _client_guid)) => {
+                println!("🔍 [UNCONNECTED PING] from {}", remote_addr);
+                println!("   └─ Timestamp: {}", timestamp);
+
                 // Send pong response
+                let pong_data = self.pong_data.read().await;
                 let pong = encode_unconnected_pong(
                     timestamp,
                     self.server_guid,
-                    &self.pong_data,
+                    &pong_data,
                 );
 
                 self.socket.send_to(&pong, remote_addr).await?;
+                println!("   ✓ Sent UNCONNECTED PONG ({} bytes)\n", pong.len());
             }
             Err(e) => {
                 // Log error but continue serving other clients
-                eprintln!("Invalid unconnected ping from {}: {}", remote_addr, e);
+                eprintln!("   ✗ Invalid unconnected ping from {}: {}", remote_addr, e);
             }
         }
 
@@ -186,8 +228,14 @@ impl RakNetListener {
     async fn handle_open_connection_request_1(&self, packet: &[u8], remote_addr: SocketAddr) -> Result<()> {
         match decode_open_connection_request_1(packet) {
             Ok((protocol_version, mtu)) => {
+                println!("🤝 [OPEN CONNECTION REQUEST 1] from {}", remote_addr);
+                println!("   ├─ Protocol version: {}", protocol_version);
+                println!("   └─ Requested MTU: {} bytes", mtu);
+
                 // Check protocol version
                 if protocol_version != PROTOCOL_VERSION {
+                    println!("   ✗ Incompatible protocol version! Expected {}, got {}", PROTOCOL_VERSION, protocol_version);
+
                     // Send incompatible protocol version packet
                     let mut response = vec![0u8; 1 + 16 + 1 + 8];
                     response[0] = ID_INCOMPATIBLE_PROTOCOL_VERSION;
@@ -197,6 +245,7 @@ impl RakNetListener {
                     response[18..26].copy_from_slice(&self.server_guid.to_be_bytes());
 
                     self.socket.send_to(&response, remote_addr).await?;
+                    println!("   ✓ Sent INCOMPATIBLE PROTOCOL VERSION\n");
                     return Ok(());
                 }
 
@@ -206,9 +255,10 @@ impl RakNetListener {
                 // Send reply
                 let reply = encode_open_connection_reply_1(self.server_guid, mtu);
                 self.socket.send_to(&reply, remote_addr).await?;
+                println!("   ✓ Sent OPEN CONNECTION REPLY 1 (MTU: {} bytes)\n", mtu);
             }
             Err(e) => {
-                eprintln!("Invalid open connection request 1 from {}: {}", remote_addr, e);
+                eprintln!("   ✗ Invalid open connection request 1 from {}: {}", remote_addr, e);
             }
         }
 
@@ -224,30 +274,42 @@ impl RakNetListener {
         {
             let connections = self.connections.read().await;
             if connections.contains_key(&remote_addr) {
+                println!("⚠️  [ALREADY CONNECTED] from {}", remote_addr);
                 // Send already connected packet
                 let response = Bytes::from_static(&[ID_ALREADY_CONNECTED]);
                 self.socket.send_to(&response, remote_addr).await?;
+                println!("   ✓ Sent ALREADY CONNECTED response\n");
                 return Ok(());
             }
         }
 
+        println!("🔐 [OPEN CONNECTION REQUEST 2] from {}", remote_addr);
+
         // Decode request
-        let (_server_addr, mtu, _client_guid) = match decode_open_connection_request_2(packet) {
+        let (_server_addr, mtu, client_guid) = match decode_open_connection_request_2(packet) {
             Ok(data) => data,
             Err(e) => {
-                eprintln!("Invalid open connection request 2 from {}: {}", remote_addr, e);
+                eprintln!("   ✗ Invalid open connection request 2 from {}: {}", remote_addr, e);
                 return Ok(());
             }
         };
 
+        println!("   ├─ Client GUID: {}", client_guid);
+        println!("   └─ MTU: {} bytes", mtu);
+
         // MTU should be reasonable
         let mtu = mtu.clamp(576, 1500);
 
+        println!("   🔧 Creating session socket with SO_REUSEPORT...");
+
         // Create session socket with SO_REUSEPORT on the same port
         let session_socket = match socket::create_tokio_session(self.local_addr, remote_addr).await {
-            Ok(sock) => sock,
+            Ok(sock) => {
+                println!("   ✓ Session socket created on {}", self.local_addr);
+                sock
+            }
             Err(e) => {
-                eprintln!("Failed to create session socket for {}: {}", remote_addr, e);
+                eprintln!("   ✗ Failed to create session socket for {}: {}", remote_addr, e);
                 return Ok(());
             }
         };
@@ -255,6 +317,8 @@ impl RakNetListener {
         // Send reply from session socket (this establishes the 4-tuple routing)
         let reply = encode_open_connection_reply_2(self.server_guid, remote_addr, mtu);
         session_socket.send(&reply).await?;
+        println!("   ✓ Sent OPEN CONNECTION REPLY 2 from session socket");
+        println!("   ℹ️  4-tuple established: kernel will now route packets to session socket");
 
         // Create RakNetStream for this connection
         let stream = RakNetStream::new(session_socket, remote_addr, mtu);
@@ -269,9 +333,12 @@ impl RakNetListener {
             connections.insert(remote_addr, ());
         }
 
+        println!("   ✅ Connection handshake complete!");
+        println!("   📨 Sending connection to accept queue...\n");
+
         // Send to accept channel
         if let Err(e) = self.accept_tx.send(stream) {
-            eprintln!("Failed to send stream to accept channel: {}", e);
+            eprintln!("   ✗ Failed to send stream to accept channel: {}", e);
         }
 
         Ok(())
@@ -292,8 +359,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_set_pong_data() {
-        let mut listener = RakNetListener::bind("127.0.0.1:0").await.unwrap();
-        listener.set_pong_data("Custom MOTD");
-        assert_eq!(&listener.pong_data[..], b"Custom MOTD");
+        let listener = RakNetListener::bind("127.0.0.1:0").await.unwrap();
+        listener.set_pong_data("Custom MOTD").await;
+        let pong_data = listener.pong_data.read().await;
+        assert_eq!(&pong_data[..], b"Custom MOTD");
     }
 }

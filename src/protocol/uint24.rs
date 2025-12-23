@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 /// A 24-bit unsigned integer (0 to 16,777,215).
 /// Internally stored as u32 with the upper 8 bits always zero.
+#[allow(non_camel_case_types)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct u24(u32);
 

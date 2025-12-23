@@ -170,7 +170,7 @@ impl AckRangeList {
                     }
                     s.get() > seq_val
                 }
-                AckRange::Range { start, end } => {
+                AckRange::Range { start, end: _ } => {
                     if range.contains(seq) {
                         return true; // Already in range
                     }

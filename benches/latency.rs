@@ -1,6 +1,5 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use raknet::{Frame, Reliability, u24};
-use raknet::protocol::*;
 use raknet::reliability::{SendQueue, RecvWindow, OrderedChannel};
 use bytes::Bytes;
 
