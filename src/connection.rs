@@ -10,7 +10,7 @@ use crate::state::SharedState;
 use bytes::{Bytes, BytesMut};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::interval;
@@ -152,7 +152,7 @@ async fn receive_task(
         match socket.recv(&mut buf).await {
             Ok(len) => {
                 let packet = &buf[..len];
-                if let Err(e) = handle_packet(packet, &state, &app_data_tx).await {
+                if let Err(e) = handle_packet(packet, &state, &app_data_tx, &socket).await {
                     eprintln!("Error handling packet: {}", e);
                 }
                 state.metrics.record_recv(len);
@@ -172,6 +172,7 @@ async fn handle_packet(
     packet: &[u8],
     state: &Arc<SharedState>,
     app_data_tx: &mpsc::UnboundedSender<Bytes>,
+    socket: &UdpSocket,
 ) -> Result<()> {
     if packet.is_empty() {
         return Ok(());
@@ -182,15 +183,11 @@ async fn handle_packet(
     match packet_id {
         // Connected ping/pong
         ID_CONNECTED_PING => {
-            let _timestamp = decode_connected_ping(packet)?;
-            // TODO: Send pong back
-            Ok(())
+            handle_connected_ping(packet, state, &socket).await
         }
 
         ID_CONNECTED_PONG => {
-            let (_ping_ts, _pong_ts) = decode_connected_pong(packet)?;
-            // TODO: Update RTT
-            Ok(())
+            handle_connected_pong(packet, state).await
         }
 
         ID_DISCONNECT_NOTIFICATION => {
@@ -357,6 +354,38 @@ async fn handle_ack(ranges: AckRangeList, state: &Arc<SharedState>) -> Result<()
 async fn handle_nack(_ranges: AckRangeList, _state: &Arc<SharedState>) -> Result<()> {
     // TODO: Immediately retransmit NACKed packets
     // For now, the tick task will handle retransmission
+
+    Ok(())
+}
+
+/// Handles a ConnectedPing packet and sends a pong response.
+async fn handle_connected_ping(
+    packet: &[u8],
+    _state: &Arc<SharedState>,
+    socket: &UdpSocket,
+) -> Result<()> {
+    let ping_timestamp = decode_connected_ping(packet)?;
+
+    let pong_timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
+    let pong = encode_connected_pong(ping_timestamp, pong_timestamp);
+    socket.send(&pong).await?;
+
+    Ok(())
+}
+
+/// Handles a ConnectedPong packet and updates RTT metrics.
+async fn handle_connected_pong(packet: &[u8], state: &Arc<SharedState>) -> Result<()> {
+    let (ping_timestamp, _pong_timestamp) = decode_connected_pong(packet)?;
+
+    // Look up when we sent the ping
+    if let Some(send_time) = state.pending_pings.lock().remove(&ping_timestamp) {
+        let rtt = send_time.elapsed();
+        state.metrics.update_rtt(rtt);
+    }
 
     Ok(())
 }
@@ -601,6 +630,11 @@ async fn send_keepalive_ping(socket: &UdpSocket, state: &Arc<SharedState>) -> Re
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64;
+
+    let send_time = Instant::now();
+
+    // Track ping for RTT calculation
+    state.pending_pings.lock().insert(timestamp, send_time);
 
     let ping = encode_connected_ping(timestamp);
     socket.send(&ping).await?;

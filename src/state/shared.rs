@@ -10,8 +10,10 @@ use crate::reliability::{
 };
 use crate::state::{AtomicConnectionState, ConnectionState, ConnectionMetrics};
 use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 /// Shared state for a RakNet connection.
 ///
@@ -60,6 +62,9 @@ pub struct SharedState {
     /// Pending NACKs to send.
     pub pending_nacks: Mutex<AckRangeList>,
 
+    /// Pending pings (timestamp -> send_time) for RTT calculation.
+    pub pending_pings: Mutex<HashMap<i64, Instant>>,
+
     // === Index counters (atomic) ===
 
     /// Next message index for reliable packets.
@@ -90,6 +95,7 @@ impl SharedState {
             ordered_channels: array_init::array_init(|_| Mutex::new(OrderedChannel::new())),
             pending_acks: Mutex::new(AckRangeList::new()),
             pending_nacks: Mutex::new(AckRangeList::new()),
+            pending_pings: Mutex::new(HashMap::new()),
 
             // Index counters
             message_index: AtomicU24::new(0),
