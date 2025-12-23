@@ -1,24 +1,40 @@
 /// Fragmentation and reassembly for large packets.
 ///
-/// This module will handle splitting packets that exceed the MTU
+/// This module handles splitting packets that exceed the MTU
 /// and reassembling them on the receiver side.
-///
-/// TODO: Implement in Phase 3
 
 use bytes::Bytes;
 use std::collections::{BTreeMap, HashMap};
+use std::time::{Duration, Instant};
 
 /// Fragment queue for reassembling split packets.
 ///
 /// Tracks incomplete fragmented packets and assembles them once all
-/// fragments are received.
+/// fragments are received. Includes timeout mechanism to prevent
+/// memory leaks from incomplete packets.
 #[derive(Debug)]
 pub struct FragmentQueue {
-    /// Map of split_id -> (parts_received, total_parts, fragments)
-    splits: HashMap<u16, (u32, u32, BTreeMap<u32, Bytes>)>,
+    /// Map of split_id -> FragmentEntry
+    splits: HashMap<u16, FragmentEntry>,
 
     /// Maximum number of concurrent incomplete splits (default: 512)
     max_concurrent: usize,
+
+    /// Timeout for incomplete fragments (default: 8 seconds)
+    timeout: Duration,
+}
+
+/// Entry for a single fragmented packet being reassembled.
+#[derive(Debug)]
+struct FragmentEntry {
+    /// Total number of fragments expected
+    total_count: u32,
+
+    /// Fragments received so far (index -> data)
+    fragments: BTreeMap<u32, Bytes>,
+
+    /// Time when first fragment was received
+    first_received: Instant,
 }
 
 impl FragmentQueue {
@@ -32,13 +48,26 @@ impl FragmentQueue {
         Self {
             splits: HashMap::new(),
             max_concurrent,
+            timeout: Duration::from_secs(8),
         }
+    }
+
+    /// Sets the timeout for incomplete fragments.
+    pub fn set_timeout(&mut self, timeout: Duration) {
+        self.timeout = timeout;
     }
 
     /// Inserts a fragment into the queue.
     ///
     /// Returns `Some(reassembled_data)` if all fragments have been received,
     /// `None` otherwise.
+    ///
+    /// # Arguments
+    ///
+    /// * `split_id` - Unique identifier for this fragmented packet
+    /// * `index` - Index of this fragment (0 to count-1)
+    /// * `count` - Total number of fragments
+    /// * `data` - Fragment data
     pub fn insert(
         &mut self,
         split_id: u16,
@@ -46,23 +75,69 @@ impl FragmentQueue {
         count: u32,
         data: Bytes,
     ) -> Option<Bytes> {
+        // Validate fragment index
+        if index >= count {
+            return None; // Invalid fragment
+        }
+
         // Check if we're at capacity
         if self.splits.len() >= self.max_concurrent && !self.splits.contains_key(&split_id) {
-            return None; // Drop fragment
+            return None; // Drop fragment - queue full
         }
 
-        let entry = self.splits.entry(split_id).or_insert((0, count, BTreeMap::new()));
+        // Get or create entry
+        let entry = self.splits.entry(split_id).or_insert_with(|| FragmentEntry {
+            total_count: count,
+            fragments: BTreeMap::new(),
+            first_received: Instant::now(),
+        });
 
-        entry.2.insert(index, data);
-        entry.0 += 1;
+        // Verify total count matches (all fragments should have same count)
+        if entry.total_count != count {
+            // Mismatch - remove corrupted entry
+            self.splits.remove(&split_id);
+            return None;
+        }
+
+        // Check for duplicate fragment
+        if entry.fragments.contains_key(&index) {
+            return None; // Duplicate, ignore
+        }
+
+        // Insert fragment
+        entry.fragments.insert(index, data);
 
         // Check if complete
-        if entry.0 == entry.1 {
-            let (_, _, fragments) = self.splits.remove(&split_id)?;
-            Some(reassemble(fragments))
-        } else {
-            None
+        if entry.fragments.len() == count as usize {
+            // All fragments received - reassemble
+            if let Some(entry) = self.splits.remove(&split_id) {
+                return Some(reassemble(entry.fragments));
+            }
         }
+
+        None
+    }
+
+    /// Cleans up expired incomplete fragments.
+    ///
+    /// Returns the number of fragments cleaned up.
+    pub fn cleanup_expired(&mut self) -> usize {
+        let now = Instant::now();
+        let timeout = self.timeout;
+
+        let expired: Vec<u16> = self
+            .splits
+            .iter()
+            .filter(|(_, entry)| now.duration_since(entry.first_received) > timeout)
+            .map(|(id, _)| *id)
+            .collect();
+
+        let count = expired.len();
+        for id in expired {
+            self.splits.remove(&id);
+        }
+
+        count
     }
 
     /// Returns the number of incomplete split packets.
@@ -126,5 +201,67 @@ mod tests {
         queue.insert(1, 1, 2, Bytes::from("b"));
 
         assert_eq!(queue.len(), 1); // Split 1 complete, split 2 incomplete
+    }
+
+    #[test]
+    fn test_duplicate_fragments() {
+        let mut queue = FragmentQueue::new();
+
+        assert!(queue.insert(1, 0, 2, Bytes::from("hello")).is_none());
+        assert!(queue.insert(1, 0, 2, Bytes::from("duplicate")).is_none()); // Duplicate ignored
+
+        let result = queue.insert(1, 1, 2, Bytes::from("world"));
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), Bytes::from("helloworld"));
+    }
+
+    #[test]
+    fn test_invalid_fragment_index() {
+        let mut queue = FragmentQueue::new();
+
+        // Index >= count is invalid
+        assert!(queue.insert(1, 5, 3, Bytes::from("invalid")).is_none());
+        assert_eq!(queue.len(), 0);
+    }
+
+    #[test]
+    fn test_count_mismatch() {
+        let mut queue = FragmentQueue::new();
+
+        queue.insert(1, 0, 3, Bytes::from("a"));
+        // Different count for same split_id - should reject
+        assert!(queue.insert(1, 1, 5, Bytes::from("b")).is_none());
+        assert_eq!(queue.len(), 0); // Entry removed due to mismatch
+    }
+
+    #[test]
+    fn test_cleanup_expired() {
+        let mut queue = FragmentQueue::new();
+        queue.set_timeout(Duration::from_millis(100));
+
+        queue.insert(1, 0, 2, Bytes::from("a"));
+        assert_eq!(queue.len(), 1);
+
+        // Wait for timeout
+        std::thread::sleep(Duration::from_millis(150));
+
+        let cleaned = queue.cleanup_expired();
+        assert_eq!(cleaned, 1);
+        assert_eq!(queue.len(), 0);
+    }
+
+    #[test]
+    fn test_capacity_limit() {
+        let mut queue = FragmentQueue::with_capacity(2);
+
+        queue.insert(1, 0, 2, Bytes::from("a"));
+        queue.insert(2, 0, 2, Bytes::from("b"));
+
+        // At capacity - new split_id should be rejected
+        assert!(queue.insert(3, 0, 2, Bytes::from("c")).is_none());
+        assert_eq!(queue.len(), 2);
+
+        // But can still add to existing split_id
+        assert!(queue.insert(1, 1, 2, Bytes::from("x")).is_some());
     }
 }

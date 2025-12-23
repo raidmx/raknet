@@ -271,28 +271,34 @@ async fn handle_frame(
     match frame.reliability {
         Reliability::Unreliable | Reliability::UnreliableSequenced => {
             // Deliver immediately
-            deliver_frame_payload(frame, app_data_tx);
+            deliver_frame_payload(frame, state, app_data_tx);
         }
 
         Reliability::Reliable | Reliability::ReliableOrdered | Reliability::ReliableSequenced => {
             // For reliable packets, check ordering if needed
             if frame.reliability.is_ordered() {
-                // Use ordered channel
-                let channel = frame.order_channel as usize;
-                let mut ordered_chan = state.ordered_channels[channel].lock();
+                // Check if fragmented
+                if frame.split.is_some() {
+                    // Fragment reassembly first
+                    deliver_frame_payload(frame, state, app_data_tx);
+                } else {
+                    // Use ordered channel
+                    let channel = frame.order_channel as usize;
+                    let mut ordered_chan = state.ordered_channels[channel].lock();
 
-                let payloads = ordered_chan.insert(
-                    frame.order_index.unwrap_or(u24::new(0)).get(),
-                    frame.payload.clone()
-                );
+                    let payloads = ordered_chan.insert(
+                        frame.order_index.unwrap_or(u24::new(0)).get(),
+                        frame.payload
+                    );
 
-                // Deliver all ready packets in order
-                for payload in payloads {
-                    let _ = app_data_tx.send(payload);
+                    // Deliver all ready packets in order
+                    for payload in payloads {
+                        let _ = app_data_tx.send(payload);
+                    }
                 }
             } else {
                 // Deliver immediately for non-ordered reliable
-                deliver_frame_payload(frame, app_data_tx);
+                deliver_frame_payload(frame, state, app_data_tx);
             }
         }
     }
@@ -301,15 +307,32 @@ async fn handle_frame(
 }
 
 /// Delivers a frame's payload to the application.
-fn deliver_frame_payload(frame: Frame, app_data_tx: &mpsc::UnboundedSender<Bytes>) {
+///
+/// Handles fragment reassembly for split packets.
+fn deliver_frame_payload(
+    frame: Frame,
+    state: &Arc<SharedState>,
+    app_data_tx: &mpsc::UnboundedSender<Bytes>,
+) {
     // Check if frame is split (fragmented)
-    if frame.split.is_some() {
-        // TODO: Handle fragment reassembly
-        // For now, just drop fragmented packets
-        return;
-    }
+    if let Some(split_info) = frame.split {
+        // Fragment reassembly
+        let mut fragment_queue = state.fragment_queue.lock();
 
-    let _ = app_data_tx.send(frame.payload.clone());
+        if let Some(reassembled) = fragment_queue.insert(
+            split_info.id,
+            split_info.index,
+            split_info.count,
+            frame.payload,
+        ) {
+            // All fragments received - deliver complete packet
+            let _ = app_data_tx.send(reassembled);
+        }
+        // Otherwise wait for more fragments
+    } else {
+        // Not fragmented - deliver immediately
+        let _ = app_data_tx.send(frame.payload);
+    }
 }
 
 /// Handles ACK ranges.
@@ -349,14 +372,93 @@ async fn send_task(
             break;
         }
 
-        // Create frame with reliable ordered delivery
+        // Check if data needs fragmentation
+        let mtu = state.mtu() as usize;
+        let max_single_frame_size = mtu - 60; // Account for headers (datagram + frame + IP/UDP)
+
+        if data.len() <= max_single_frame_size {
+            // Send as single frame
+            if let Err(e) = send_single_frame(data, &socket, &state).await {
+                eprintln!("Error sending frame: {}", e);
+                break;
+            }
+        } else {
+            // Fragment and send multiple frames
+            if let Err(e) = send_fragmented(data, &socket, &state).await {
+                eprintln!("Error sending fragmented packet: {}", e);
+                break;
+            }
+        }
+    }
+}
+
+/// Sends a single unfragmented frame.
+async fn send_single_frame(
+    data: Bytes,
+    socket: &UdpSocket,
+    state: &Arc<SharedState>,
+) -> Result<()> {
+    let reliability = Reliability::ReliableOrdered;
+    let message_index = state.next_message_index();
+    let order_index = state.next_order_index(0);
+
+    let frame = Frame::new(reliability, data)
+        .with_message_index(message_index)
+        .with_order(order_index, 0);
+
+    // Encode frame
+    let mut frame_buf = BytesMut::new();
+    frame.encode(&mut frame_buf);
+    let encoded_frame = frame_buf.freeze();
+
+    // Create datagram
+    let seq = state.next_send_seq();
+    let datagram = encode_datagram(seq, &[encoded_frame]);
+
+    // Send datagram
+    socket.send(&datagram).await?;
+    state.metrics.record_send(datagram.len());
+
+    // Add to send queue for tracking
+    let mut queue = state.send_queue.lock();
+    queue.insert(seq.get(), datagram);
+
+    Ok(())
+}
+
+/// Sends a fragmented packet as multiple frames.
+async fn send_fragmented(
+    data: Bytes,
+    socket: &UdpSocket,
+    state: &Arc<SharedState>,
+) -> Result<()> {
+    let split_id = state.next_split_id();
+    let mtu = state.mtu() as usize;
+
+    // Calculate chunk size (MTU - headers - split info overhead)
+    let chunk_size = mtu - 80; // Conservative estimate for all headers
+
+    // Split data into chunks
+    let total_count = ((data.len() + chunk_size - 1) / chunk_size) as u32;
+
+    for (index, chunk_start) in (0..data.len()).step_by(chunk_size).enumerate() {
+        let chunk_end = (chunk_start + chunk_size).min(data.len());
+        let chunk = data.slice(chunk_start..chunk_end);
+
+        let split_info = SplitInfo {
+            count: total_count,
+            id: split_id,
+            index: index as u32,
+        };
+
         let reliability = Reliability::ReliableOrdered;
         let message_index = state.next_message_index();
         let order_index = state.next_order_index(0);
 
-        let frame = Frame::new(reliability, data)
+        let frame = Frame::new(reliability, chunk)
             .with_message_index(message_index)
-            .with_order(order_index, 0);
+            .with_order(order_index, 0)
+            .with_split(split_info);
 
         // Encode frame
         let mut frame_buf = BytesMut::new();
@@ -365,22 +467,23 @@ async fn send_task(
 
         // Create datagram
         let seq = state.next_send_seq();
-        let datagram = encode_datagram(seq, &[encoded_frame.clone()]);
+        let datagram = encode_datagram(seq, &[encoded_frame]);
 
         // Send datagram
-        if let Err(e) = socket.send(&datagram).await {
-            eprintln!("Error sending datagram: {}", e);
-            break;
-        }
-
+        socket.send(&datagram).await?;
         state.metrics.record_send(datagram.len());
 
         // Add to send queue for tracking
         {
             let mut queue = state.send_queue.lock();
-            queue.insert(seq.get(), datagram);
-        }
+            queue.insert(seq.get(), datagram.clone());
+        } // Lock dropped here
+
+        // Small delay between fragments to avoid overwhelming receiver
+        tokio::time::sleep(Duration::from_micros(100)).await;
     }
+
+    Ok(())
 }
 
 /// Tick task - periodic maintenance (ACK flush, retransmission, keepalive).
@@ -417,6 +520,14 @@ async fn tick_task(socket: Arc<UdpSocket>, state: Arc<SharedState>) {
         if ping_counter % 3 == 0 {
             if let Err(e) = check_retransmissions(&socket, &state).await {
                 eprintln!("Error checking retransmissions: {}", e);
+            }
+        }
+
+        // Cleanup expired fragments (every 2 seconds = 20 ticks)
+        if ping_counter % 20 == 0 {
+            let cleaned = state.fragment_queue.lock().cleanup_expired();
+            if cleaned > 0 {
+                eprintln!("Cleaned up {} expired fragment entries", cleaned);
             }
         }
 
